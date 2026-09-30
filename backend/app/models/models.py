@@ -101,6 +101,7 @@ class Contractor(Timestamped, Base):
     industry_type_id: Mapped[str | None] = mapped_column(ForeignKey("industry_types.id"))
     other_industry_name: Mapped[str | None] = mapped_column(String(150))
     state_id: Mapped[str | None] = mapped_column(ForeignKey("states.id"))
+    city: Mapped[str | None] = mapped_column(String(100))
     contact_email: Mapped[str | None] = mapped_column(String(255))
     contact_phone: Mapped[str | None] = mapped_column(String(50))
     pincode: Mapped[str | None] = mapped_column(String(20))

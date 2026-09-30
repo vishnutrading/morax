@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
 
 class ORMModel(BaseModel):
@@ -213,6 +213,16 @@ class RuleInput(BaseModel):
     effective_from: date
     effective_to: date | None = None
     active: bool = True
+
+    @model_validator(mode="after")
+    def effective_dates_are_in_order(self) -> "RuleInput":
+        if self.effective_to and self.effective_to < self.effective_from:
+            raise ValueError("Effective To cannot be earlier than Effective From")
+        return self
+
+
+class RuleStatusInput(BaseModel):
+    active: bool
 
 
 class GenerationRequest(BaseModel):

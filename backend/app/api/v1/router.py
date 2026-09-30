@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.security import create_access_token, hash_password, verify_password
@@ -20,7 +21,7 @@ from app.models import (
 from app.schemas import (
     ActivityInput, AssignmentInput, CommentInput, ContractorInput, ContractorSiteInput, GenerationRequest,
     LoginRequest, OrganizationInput, PlatformOrganizationInput, OrganizationStatusInput, PasswordChangeRequest, RoleScopeInput, RuleInput, UnitInput, UserInput,
-    WorkflowDecision, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput,
+    WorkflowDecision, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput, RuleStatusInput,
 )
 from app.services.access import CHECKER_ROLES, MAKER_ROLES, MANAGER_ROLES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, current_user, is_org_admin, require_org_admin, require_org_admin_for_entity_management, roles_for, scopes_for, user_summary
 from app.services.audit import audit
@@ -97,6 +98,34 @@ def require_deletable_entity(db: Session, subject_type: str, subject_id: str) ->
         raise HTTPException(409, f"Cannot delete {label} because it has compliance history. Set its status to INACTIVE instead.")
 
 
+def commit_or_conflict(db: Session, detail: str) -> None:
+    """Turn expected unique-key races into a usable API validation response."""
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, detail) from exc
+
+
+def require_scope_belongs_to_organization(
+    db: Session, organization_id: str, scope_type: str, scope_id: str
+) -> None:
+    if scope_type == "ORGANIZATION":
+        if scope_id != organization_id:
+            raise HTTPException(422, "Organization scope must be the active organization")
+        return
+    model = {
+        "UNIT": Unit,
+        "CONTRACTOR": Contractor,
+        "CONTRACTOR_SITE": ContractorSite,
+    }.get(scope_type)
+    if not model:
+        raise HTTPException(422, "Unsupported role scope type")
+    subject = db.get(model, scope_id)
+    if not subject or subject.organization_id != organization_id:
+        raise HTTPException(422, "Role scope must belong to the active organization")
+
+
 def validate_industry_selection(db: Session, industry_type_id: str | None, other_industry_name: str | None) -> str | None:
     """Validate the controlled industry category and its optional custom label.
 
@@ -122,6 +151,51 @@ def list_page(items: list, page: int, page_size: int) -> dict:
     total = len(items)
     offset = (page - 1) * page_size
     return {"items": items[offset:offset + page_size], "total": total, "page": page, "page_size": page_size}
+
+
+def entity_page(
+    db: Session,
+    model,
+    entity_type: str,
+    organization_id: str,
+    page: int,
+    page_size: int,
+    q: str | None = None,
+    status: str | None = None,
+    sort_by: str = "name",
+    sort_dir: str = "asc",
+) -> dict:
+    """Return a bounded, tenant-scoped page for the entity management grids.
+
+    The public entity endpoints still support their legacy list response where
+    required. New UI consumers opt into this paged path, keeping the API
+    compatible while avoiding unbounded record transfers as organizations grow.
+    """
+    filters = [model.organization_id == organization_id]
+    if q:
+        text = f"%{q.strip()}%"
+        filters.append(or_(model.name.ilike(text), model.code.ilike(text)))
+    if status:
+        filters.append(model.status == status.upper())
+    allowed_sorts = {"name", "code", "status", "city"}
+    column = getattr(model, sort_by if sort_by in allowed_sorts else "name")
+    ordering = column.desc() if sort_dir.lower() == "desc" else column.asc()
+    safe_page = max(page, 1)
+    safe_size = min(max(page_size, 1), 100)
+    total = db.scalar(select(func.count()).select_from(model).where(*filters)) or 0
+    rows = db.scalars(
+        select(model)
+        .where(*filters)
+        .order_by(ordering, model.id)
+        .offset((safe_page - 1) * safe_size)
+        .limit(safe_size)
+    ).all()
+    return {
+        "items": [entity_dict(db, row, entity_type) for row in rows],
+        "total": total,
+        "page": safe_page,
+        "page_size": safe_size,
+    }
 
 
 def parse_bool(value, default=True):
@@ -418,14 +492,10 @@ def update_organization(payload: OrganizationInput, user: User = Depends(current
 
 
 @router.get("/units")
-def list_units(page: int = 1, page_size: int = 50, q: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def list_units(page: int = 1, page_size: int = 50, q: str | None = None, status: str | None = None, sort_by: str = "name", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     organization_id = org_for(user)
     require_org_admin_for_entity_management(db, user, organization_id)
-    query = select(Unit).where(Unit.organization_id == organization_id)
-    if q:
-        query = query.where(or_(Unit.name.ilike(f"%{q}%"), Unit.code.ilike(f"%{q}%")))
-    rows = [entity_dict(db, row, "UNIT") for row in db.scalars(query.order_by(Unit.name))]
-    return list_page(rows, page, min(page_size, 100))
+    return entity_page(db, Unit, "UNIT", organization_id, page, page_size, q, status, sort_by, sort_dir)
 
 
 @router.get("/units/{unit_id}")
@@ -441,6 +511,8 @@ def get_unit(unit_id: str, user: User = Depends(current_user), db: Session = Dep
 def create_unit(payload: UnitInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     organization_id = org_for(user)
     require_org_admin_for_entity_management(db, user, organization_id)
+    if db.scalar(select(Unit).where(Unit.organization_id == organization_id, Unit.code == payload.code)):
+        raise HTTPException(409, "A unit with this code already exists in the organization")
     if not db.get(State, payload.state_id) or not db.get(IndustryType, payload.industry_type_id):
         raise HTTPException(422, "State and industry type must be configured master values")
     payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
@@ -449,7 +521,7 @@ def create_unit(payload: UnitInput, user: User = Depends(current_user), db: Sess
     db.flush()
     generate_for_subject(db, organization_id, "UNIT", unit.id, date.today(), user.id)
     audit(db, organization_id=organization_id, actor_id=user.id, action="CREATE_UNIT", module="ENTITIES", entity_type="Unit", entity_id=unit.id, new={"name": unit.name, "code": unit.code})
-    db.commit()
+    commit_or_conflict(db, "A unit with this code already exists in the organization")
     return entity_dict(db, unit, "UNIT")
 
 
@@ -459,6 +531,8 @@ def update_unit(unit_id: str, payload: UnitInput, user: User = Depends(current_u
     if not unit or unit.organization_id != org_for(user):
         raise HTTPException(404, "Unit not found")
     require_org_admin_for_entity_management(db, user, unit.organization_id)
+    if db.scalar(select(Unit).where(Unit.organization_id == unit.organization_id, Unit.code == payload.code, Unit.id != unit.id)):
+        raise HTTPException(409, "A unit with this code already exists in the organization")
     if not db.get(State, payload.state_id):
         raise HTTPException(422, "State must be a configured master value")
     payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
@@ -466,7 +540,7 @@ def update_unit(unit_id: str, payload: UnitInput, user: User = Depends(current_u
     for key, value in payload.model_dump().items(): setattr(unit, key, value)
     generate_for_subject(db, unit.organization_id, "UNIT", unit.id, date.today(), user.id)
     audit(db, organization_id=unit.organization_id, actor_id=user.id, action="UPDATE_UNIT", module="ENTITIES", entity_type="Unit", entity_id=unit.id, old=old, new={"industry_type_id": unit.industry_type_id, "other_industry_name": unit.other_industry_name, "state_id": unit.state_id, "status": unit.status})
-    db.commit()
+    commit_or_conflict(db, "A unit with this code already exists in the organization")
     return entity_dict(db, unit, "UNIT")
 
 
@@ -488,9 +562,11 @@ def delete_unit(unit_id: str, user: User = Depends(current_user), db: Session = 
 
 
 @router.get("/contractors")
-def list_contractors(user: User = Depends(current_user), db: Session = Depends(get_db)):
+def list_contractors(paginated: bool = False, page: int = 1, page_size: int = 50, q: str | None = None, status: str | None = None, sort_by: str = "name", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
     require_org_admin_for_entity_management(db, user, org)
+    if paginated:
+        return entity_page(db, Contractor, "CONTRACTOR", org, page, page_size, q, status, sort_by, sort_dir)
     return [entity_dict(db, row, "CONTRACTOR") for row in db.scalars(select(Contractor).where(Contractor.organization_id == org).order_by(Contractor.name))]
 
 
@@ -506,6 +582,8 @@ def get_contractor(contractor_id: str, user: User = Depends(current_user), db: S
 @router.post("/contractors")
 def create_contractor(payload: ContractorInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user); require_org_admin_for_entity_management(db, user, org)
+    if db.scalar(select(Contractor).where(Contractor.organization_id == org, Contractor.code == payload.code)):
+        raise HTTPException(409, "A contractor with this code already exists in the organization")
     if payload.unit_id and (not db.get(Unit, payload.unit_id) or db.get(Unit, payload.unit_id).organization_id != org):
         raise HTTPException(422, "Parent Unit must belong to your organization")
     if payload.state_id and not db.get(State, payload.state_id):
@@ -515,7 +593,7 @@ def create_contractor(payload: ContractorInput, user: User = Depends(current_use
     db.add(contractor); db.flush()
     generate_for_subject(db, org, "CONTRACTOR", contractor.id, date.today(), user.id)
     audit(db, organization_id=org, actor_id=user.id, action="CREATE_CONTRACTOR", module="ENTITIES", entity_type="Contractor", entity_id=contractor.id, new={"name": contractor.name})
-    db.commit(); return entity_dict(db, contractor, "CONTRACTOR")
+    commit_or_conflict(db, "A contractor with this code already exists in the organization"); return entity_dict(db, contractor, "CONTRACTOR")
 
 
 @router.patch("/contractors/{contractor_id}")
@@ -524,6 +602,8 @@ def update_contractor(contractor_id: str, payload: ContractorInput, user: User =
     if not contractor or contractor.organization_id != org_for(user):
         raise HTTPException(404, "Contractor not found")
     require_org_admin_for_entity_management(db, user, contractor.organization_id)
+    if db.scalar(select(Contractor).where(Contractor.organization_id == contractor.organization_id, Contractor.code == payload.code, Contractor.id != contractor.id)):
+        raise HTTPException(409, "A contractor with this code already exists in the organization")
     if payload.unit_id and (not db.get(Unit, payload.unit_id) or db.get(Unit, payload.unit_id).organization_id != contractor.organization_id):
         raise HTTPException(422, "Parent Unit must belong to your organization")
     if payload.state_id and not db.get(State, payload.state_id):
@@ -532,7 +612,7 @@ def update_contractor(contractor_id: str, payload: ContractorInput, user: User =
     for key, value in payload.model_dump().items(): setattr(contractor, key, value)
     generate_for_subject(db, contractor.organization_id, "CONTRACTOR", contractor.id, date.today(), user.id)
     audit(db, organization_id=contractor.organization_id, actor_id=user.id, action="UPDATE_CONTRACTOR", module="ENTITIES", entity_type="Contractor", entity_id=contractor.id, new={"name": contractor.name, "status": contractor.status})
-    db.commit(); return entity_dict(db, contractor, "CONTRACTOR")
+    commit_or_conflict(db, "A contractor with this code already exists in the organization"); return entity_dict(db, contractor, "CONTRACTOR")
 
 
 @router.delete("/contractors/{contractor_id}")
@@ -554,9 +634,11 @@ def delete_contractor(contractor_id: str, user: User = Depends(current_user), db
 
 
 @router.get("/contractor-sites")
-def list_sites(user: User = Depends(current_user), db: Session = Depends(get_db)):
+def list_sites(paginated: bool = False, page: int = 1, page_size: int = 50, q: str | None = None, status: str | None = None, sort_by: str = "name", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
     require_org_admin_for_entity_management(db, user, org)
+    if paginated:
+        return entity_page(db, ContractorSite, "CONTRACTOR_SITE", org, page, page_size, q, status, sort_by, sort_dir)
     return [entity_dict(db, row, "CONTRACTOR_SITE") for row in db.scalars(select(ContractorSite).where(ContractorSite.organization_id == org).order_by(ContractorSite.name))]
 
 
@@ -575,6 +657,8 @@ def create_site(payload: ContractorSiteInput, user: User = Depends(current_user)
     contractor = db.get(Contractor, payload.contractor_id)
     if not contractor or contractor.organization_id != org:
         raise HTTPException(422, "Contractor must belong to your organization")
+    if db.scalar(select(ContractorSite).where(ContractorSite.contractor_id == contractor.id, ContractorSite.code == payload.code)):
+        raise HTTPException(409, "A contractor site with this code already exists for the contractor")
     if payload.unit_id and (not db.get(Unit, payload.unit_id) or db.get(Unit, payload.unit_id).organization_id != org):
         raise HTTPException(422, "Linked Unit must belong to your organization")
     if not db.get(State, payload.state_id):
@@ -583,7 +667,7 @@ def create_site(payload: ContractorSiteInput, user: User = Depends(current_user)
     site = ContractorSite(organization_id=org, **payload.model_dump())
     db.add(site); db.flush(); generate_for_subject(db, org, "CONTRACTOR_SITE", site.id, date.today(), user.id)
     audit(db, organization_id=org, actor_id=user.id, action="CREATE_CONTRACTOR_SITE", module="ENTITIES", entity_type="ContractorSite", entity_id=site.id, new={"name": site.name})
-    db.commit(); return entity_dict(db, site, "CONTRACTOR_SITE")
+    commit_or_conflict(db, "A contractor site with this code already exists for the contractor"); return entity_dict(db, site, "CONTRACTOR_SITE")
 
 
 @router.patch("/contractor-sites/{site_id}")
@@ -595,13 +679,15 @@ def update_site(site_id: str, payload: ContractorSiteInput, user: User = Depends
     contractor = db.get(Contractor, payload.contractor_id)
     if not contractor or contractor.organization_id != site.organization_id:
         raise HTTPException(422, "Contractor must belong to your organization")
+    if db.scalar(select(ContractorSite).where(ContractorSite.contractor_id == contractor.id, ContractorSite.code == payload.code, ContractorSite.id != site.id)):
+        raise HTTPException(409, "A contractor site with this code already exists for the contractor")
     if not db.get(State, payload.state_id):
         raise HTTPException(422, "State must be a configured master value")
     payload.other_industry_name = validate_industry_selection(db, payload.industry_type_id, payload.other_industry_name)
     for key, value in payload.model_dump().items(): setattr(site, key, value)
     generate_for_subject(db, site.organization_id, "CONTRACTOR_SITE", site.id, date.today(), user.id)
     audit(db, organization_id=site.organization_id, actor_id=user.id, action="UPDATE_CONTRACTOR_SITE", module="ENTITIES", entity_type="ContractorSite", entity_id=site.id, new={"name": site.name, "status": site.status})
-    db.commit(); return entity_dict(db, site, "CONTRACTOR_SITE")
+    commit_or_conflict(db, "A contractor site with this code already exists for the contractor"); return entity_dict(db, site, "CONTRACTOR_SITE")
 
 
 @router.delete("/contractor-sites/{site_id}")
@@ -618,9 +704,29 @@ def delete_site(site_id: str, user: User = Depends(current_user), db: Session = 
 
 
 @router.get("/users")
-def list_users(user: User = Depends(current_user), db: Session = Depends(get_db)):
+def list_users(paginated: bool = False, page: int = 1, page_size: int = 50, q: str | None = None, active: bool | None = None, sort_by: str = "name", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user); require_org_admin(db, user, org)
-    return [user_summary(db, row) | {"active": row.active} for row in db.scalars(select(User).where(User.organization_id == org).order_by(User.name))]
+    filters = [User.organization_id == org]
+    if q:
+        text = f"%{q.strip()}%"
+        filters.append(or_(User.name.ilike(text), User.email.ilike(text)))
+    if active is not None:
+        filters.append(User.active.is_(active))
+    allowed_sorts = {"name", "email", "active"}
+    column = getattr(User, sort_by if sort_by in allowed_sorts else "name")
+    ordering = column.desc() if sort_dir.lower() == "desc" else column.asc()
+    if paginated:
+        safe_page = max(page, 1)
+        safe_size = min(max(page_size, 1), 100)
+        total = db.scalar(select(func.count()).select_from(User).where(*filters)) or 0
+        rows = db.scalars(select(User).where(*filters).order_by(ordering, User.id).offset((safe_page - 1) * safe_size).limit(safe_size)).all()
+        return {
+            "items": [user_summary(db, row) | {"active": row.active, "mobile": row.mobile} for row in rows],
+            "total": total,
+            "page": safe_page,
+            "page_size": safe_size,
+        }
+    return [user_summary(db, row) | {"active": row.active} for row in db.scalars(select(User).where(*filters).order_by(ordering, User.id))]
 
 
 @router.post("/users")
@@ -660,10 +766,17 @@ def replace_role_scopes(user_id: str, payload: list[RoleScopeInput], user: User 
     if not target or target.organization_id != org: raise HTTPException(404, "User not found")
     valid_roles = {"ORGANIZATION_ADMIN", "UNIT_ADMIN", "UNIT_MAKER", "UNIT_CHECKER", "CONTRACTOR_ADMIN", "CONTRACTOR_MAKER", "CONTRACTOR_CHECKER", "VIEWER", "AUDITOR"}
     if any(item.role not in valid_roles for item in payload): raise HTTPException(422, "Unsupported MVP role")
+    seen_scopes: set[tuple[str, str, str]] = set()
+    for item in payload:
+        key = (item.role, item.scope_type, item.scope_id)
+        if key in seen_scopes:
+            raise HTTPException(422, "Duplicate role scope is not allowed")
+        seen_scopes.add(key)
+        require_scope_belongs_to_organization(db, org, item.scope_type, item.scope_id)
     db.query(UserRoleScope).filter_by(user_id=user_id).delete()
     db.add_all([UserRoleScope(user_id=user_id, **item.model_dump()) for item in payload])
     audit(db, organization_id=org, actor_id=user.id, action="UPDATE_ROLE_SCOPES", module="USERS", entity_type="User", entity_id=user_id, new=[item.model_dump() for item in payload])
-    db.commit(); return user_summary(db, target)
+    commit_or_conflict(db, "Role scope could not be saved because it conflicts with an existing scope"); return user_summary(db, target)
 
 
 @router.get("/compliance-master/template")
@@ -676,14 +789,63 @@ def compliance_template(user: User = Depends(current_user), db: Session = Depend
     return StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": "attachment; filename=compliance-master-template.xlsx"})
 
 
+def rule_version_dict(version: ComplianceRuleVersion, rule: ComplianceRule, criteria: RuleApplicabilityCriteria) -> dict:
+    return {
+        "id": version.id, "rule_id": rule.id, "compliance_id": rule.compliance_id,
+        "name": version.name, "description": version.description, "act": version.act,
+        "rule_reference": version.rule_reference, "section": version.section,
+        "compliance_type": version.compliance_type, "document_type": version.document_type,
+        "form_number": version.form_number, "legal_description": version.legal_description,
+        "consequence_or_penalty": version.consequence_or_penalty, "version": version.version,
+        "frequency": version.frequency, "entity_type": criteria.entity_type,
+        "state_id": criteria.state_id, "industry_type_id": criteria.industry_type_id,
+        "due_date_rule": version.due_date_rule, "due_date_offset": version.due_date_offset,
+        "due_date_anchor": version.due_date_anchor, "grace_days": version.grace_days,
+        "required_document": version.required_document, "risk_level": version.risk_level,
+        "effective_from": version.effective_from, "effective_to": version.effective_to,
+        "active": version.active, "created_at": version.created_at, "updated_at": version.updated_at,
+    }
+
+
 @router.get("/compliance-rules")
-def list_rules(user: User = Depends(current_user), db: Session = Depends(get_db)):
+def list_rules(paginated: bool = False, page: int = 1, page_size: int = 50, q: str | None = None, frequency: str | None = None, active: bool | None = None, sort_by: str = "compliance_id", sort_dir: str = "asc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
     require_org_admin(db, user, org)
-    result = []
-    for version, rule, criteria in db.query(ComplianceRuleVersion, ComplianceRule, RuleApplicabilityCriteria).join(ComplianceRule, ComplianceRule.id == ComplianceRuleVersion.rule_id).join(RuleApplicabilityCriteria, RuleApplicabilityCriteria.rule_version_id == ComplianceRuleVersion.id).filter(ComplianceRule.organization_id == org).order_by(ComplianceRule.compliance_id, ComplianceRuleVersion.version.desc()):
-        result.append({"id": version.id, "rule_id": rule.id, "compliance_id": rule.compliance_id, "name": version.name, "description": version.description, "act": version.act, "rule_reference": version.rule_reference, "section": version.section, "compliance_type": version.compliance_type, "document_type": version.document_type, "form_number": version.form_number, "frequency": version.frequency, "entity_type": criteria.entity_type, "state_id": criteria.state_id, "industry_type_id": criteria.industry_type_id, "due_date_rule": version.due_date_rule, "due_date_offset": version.due_date_offset, "required_document": version.required_document, "risk_level": version.risk_level, "effective_from": version.effective_from, "effective_to": version.effective_to, "active": version.active})
-    return result
+    query = db.query(ComplianceRuleVersion, ComplianceRule, RuleApplicabilityCriteria).join(ComplianceRule, ComplianceRule.id == ComplianceRuleVersion.rule_id).join(RuleApplicabilityCriteria, RuleApplicabilityCriteria.rule_version_id == ComplianceRuleVersion.id).filter(ComplianceRule.organization_id == org)
+    if q:
+        text = f"%{q.strip()}%"
+        query = query.filter(or_(ComplianceRule.compliance_id.ilike(text), ComplianceRuleVersion.name.ilike(text), ComplianceRuleVersion.act.ilike(text)))
+    if frequency:
+        query = query.filter(ComplianceRuleVersion.frequency == frequency.upper())
+    if active is not None:
+        query = query.filter(ComplianceRuleVersion.active.is_(active))
+    ordering = {
+        "compliance_id": ComplianceRule.compliance_id,
+        "name": ComplianceRuleVersion.name,
+        "frequency": ComplianceRuleVersion.frequency,
+        "risk_level": ComplianceRuleVersion.risk_level,
+        "effective_from": ComplianceRuleVersion.effective_from,
+        "active": ComplianceRuleVersion.active,
+    }.get(sort_by, ComplianceRule.compliance_id)
+    order = ordering.desc() if sort_dir.lower() == "desc" else ordering.asc()
+    query = query.order_by(order, ComplianceRuleVersion.version.desc())
+    if not paginated:
+        return [rule_version_dict(version, rule, criteria) for version, rule, criteria in query.all()]
+    safe_page = max(page, 1)
+    safe_size = min(max(page_size, 1), 100)
+    total = query.count()
+    rows = query.offset((safe_page - 1) * safe_size).limit(safe_size).all()
+    return {"items": [rule_version_dict(version, rule, criteria) for version, rule, criteria in rows], "total": total, "page": safe_page, "page_size": safe_size}
+
+
+@router.get("/compliance-rules/{version_id}")
+def get_rule_version(version_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    org = org_for(user)
+    require_org_admin(db, user, org)
+    row = db.query(ComplianceRuleVersion, ComplianceRule, RuleApplicabilityCriteria).join(ComplianceRule, ComplianceRule.id == ComplianceRuleVersion.rule_id).join(RuleApplicabilityCriteria, RuleApplicabilityCriteria.rule_version_id == ComplianceRuleVersion.id).filter(ComplianceRuleVersion.id == version_id, ComplianceRule.organization_id == org).first()
+    if not row:
+        raise HTTPException(404, "Compliance rule version not found")
+    return rule_version_dict(*row)
 
 
 def create_rule_version(db: Session, org: str, actor: User, payload: RuleInput):
@@ -707,6 +869,21 @@ def create_rule(payload: RuleInput, user: User = Depends(current_user), db: Sess
     org = org_for(user); require_org_admin(db, user, org)
     version = create_rule_version(db, org, user, payload); db.commit()
     return {"id": version.id, "message": "Rule version created"}
+
+
+@router.patch("/compliance-rules/{version_id}/status")
+def set_rule_version_status(version_id: str, payload: RuleStatusInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    org = org_for(user)
+    require_org_admin(db, user, org)
+    row = db.query(ComplianceRuleVersion, ComplianceRule, RuleApplicabilityCriteria).join(ComplianceRule, ComplianceRule.id == ComplianceRuleVersion.rule_id).join(RuleApplicabilityCriteria, RuleApplicabilityCriteria.rule_version_id == ComplianceRuleVersion.id).filter(ComplianceRuleVersion.id == version_id, ComplianceRule.organization_id == org).first()
+    if not row:
+        raise HTTPException(404, "Compliance rule version not found")
+    version, rule, criteria = row
+    old = {"active": version.active}
+    version.active = payload.active
+    audit(db, organization_id=org, actor_id=user.id, action="ACTIVATE_RULE_VERSION" if payload.active else "DEACTIVATE_RULE_VERSION", module="COMPLIANCE_MASTER", entity_type="ComplianceRuleVersion", entity_id=version.id, old=old, new={"active": version.active, "compliance_id": rule.compliance_id, "version": version.version})
+    db.commit()
+    return rule_version_dict(version, rule, criteria)
 
 
 @router.post("/compliance-imports/validate")
@@ -976,20 +1153,33 @@ def add_comment(instance_id: str, payload: CommentInput, user: User = Depends(cu
 
 
 @router.get("/documents")
-def list_documents(q: str | None = None, entity_type: str | None = None, user: User = Depends(current_user), db: Session = Depends(get_db)):
+def list_documents(q: str | None = None, entity_type: str | None = None, verification_state: str | None = None, paginated: bool = False, page: int = 1, page_size: int = 50, sort_by: str = "created_at", sort_dir: str = "desc", user: User = Depends(current_user), db: Session = Depends(get_db)):
     org = org_for(user)
     documents = []
     for evidence, instance in db.query(ComplianceEvidence, ComplianceInstance).join(ComplianceInstance, ComplianceInstance.id == ComplianceEvidence.instance_id).filter(ComplianceInstance.organization_id == org).order_by(ComplianceEvidence.created_at.desc()):
         if entity_type and instance.subject_type != entity_type:
+            continue
+        if verification_state and evidence.verification_state != verification_state.upper():
             continue
         if not can_access_subject(db, user, org, instance.subject_type, instance.subject_id):
             continue
         if q and q.lower() not in evidence.original_filename.lower():
             continue
         row = model_dict(evidence, [field.name for field in evidence.__table__.columns])
-        row.update({"compliance_instance_id": instance.id, "entity_type": instance.subject_type, "entity_id": instance.subject_id, "period": instance.period_key})
+        detail = instance_dict(db, instance)
+        row.update({"compliance_instance_id": instance.id, "entity_type": instance.subject_type, "entity_id": instance.subject_id, "period": instance.period_key, "subject_name": detail["subject_name"], "compliance_name": detail["compliance_name"]})
         documents.append(row)
-    return documents
+    sort_key = {
+        "created_at": lambda item: str(item.get("created_at") or ""),
+        "filename": lambda item: str(item.get("original_filename") or "").lower(),
+        "verification_state": lambda item: str(item.get("verification_state") or ""),
+    }.get(sort_by, lambda item: str(item.get("created_at") or ""))
+    documents.sort(key=sort_key, reverse=sort_dir.lower() == "desc")
+    if not paginated:
+        return documents
+    safe_page = max(page, 1)
+    safe_size = min(max(page_size, 1), 100)
+    return list_page(documents, safe_page, safe_size)
 
 
 @router.get("/notifications")
@@ -1256,6 +1446,7 @@ def dashboard_overview(
                 "due_date": instance.due_date.isoformat(),
                 "status": instance.status,
                 "display_status": display_status,
+                "row_version": instance.row_version,
                 "is_overdue": display_status == "OVERDUE",
                 "days_overdue": max(0, (today_value - instance.due_date).days)
                 if display_status == "OVERDUE"

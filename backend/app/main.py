@@ -23,6 +23,7 @@ from app.models import (
     User,
     UserRoleScope,
 )
+from app.services.qa_dataset import seed_qa_demo_workspace
 
 
 def seed_dashboard_demo_data(db, organization: Organization) -> None:
@@ -193,7 +194,9 @@ def seed_dashboard_demo_data(db, organization: Organization) -> None:
         "CONTRACTOR": contractors,
         "CONTRACTOR_SITE": sites,
     }
-    offsets = [-18, -7, -2, 2, 5, 10, 18, 28]
+    # Relative dates keep the demo useful regardless of when the MVP is run:
+    # overdue, due in a few days, next week, and later in the current cycle.
+    offsets = [-18, -7, -2, 2, 5, 9, 13, 21]
     statuses = [
         "PENDING",
         "IN_PROGRESS",
@@ -217,12 +220,19 @@ def seed_dashboard_demo_data(db, organization: Organization) -> None:
                     ComplianceInstance.occurrence_key == "DASHBOARD_DEMO",
                 )
             )
-            if existing:
-                sequence += 1
-                continue
             status = statuses[sequence % len(statuses)]
             due_date = date.today() + timedelta(days=offsets[sequence % len(offsets)])
             completed_late = status == "APPROVED" and due_date < date.today()
+            if existing:
+                # These are explicitly non-production visual-test records. Keep
+                # their timeline relative to today so the dashboard always has
+                # meaningful upcoming and overdue states to demonstrate.
+                existing.status = status
+                existing.due_date = due_date
+                existing.completed_on = date.today() if status == "APPROVED" else None
+                existing.completion_late = completed_late if status == "APPROVED" else None
+                sequence += 1
+                continue
             db.add(
                 ComplianceInstance(
                     organization_id=organization.id,
@@ -262,7 +272,14 @@ def seed_dashboard_demo_data(db, organization: Organization) -> None:
 def seed_baseline() -> None:
     db = SessionLocal()
     try:
-        for name, code in [("Tamil Nadu", "TN"), ("Karnataka", "KA"), ("Maharashtra", "MH"), ("Delhi", "DL")]:
+        for name, code in [
+            ("Tamil Nadu", "TN"),
+            ("Karnataka", "KA"),
+            ("Maharashtra", "MH"),
+            ("Delhi", "DL"),
+            ("Telangana", "TS"),
+            ("Gujarat", "GJ"),
+        ]:
             if not db.scalar(select(State).where(State.code == code)): db.add(State(name=name, code=code))
         for name, code in [
             ("Air Transport Services", "AIR_TRANSPORT"), ("Any Central Govt. Undertaking", "CENTRAL_GOVT"), ("Any Other Industry", "OTHER"),
@@ -270,6 +287,8 @@ def seed_baseline() -> None:
             ("Dock Work", "DOCK_WORK"), ("Factory", "FACTORY"), ("IT Services", "IT_SERVICES"), ("Mines", "MINES"),
             ("Motor Transport Undertaking", "MOTOR_TRANSPORT"), ("Newspapers Establishment", "NEWSPAPER"), ("Plantation", "PLANTATION"),
             ("Telecommunication Services", "TELECOM"), ("Commercial", "COMMERCIAL"),
+            ("Manufacturing", "MANUFACTURING"), ("Healthcare Services", "HEALTHCARE"),
+            ("Construction", "CONSTRUCTION"), ("Automobile", "AUTOMOBILE"),
         ]:
             if not db.scalar(select(IndustryType).where(IndustryType.code == code)): db.add(IndustryType(name=name, code=code))
         db.flush()
@@ -292,7 +311,9 @@ def seed_baseline() -> None:
         user.platform_role = "MORAX_ADMIN"
         if not db.scalar(select(UserRoleScope).where(UserRoleScope.user_id == user.id, UserRoleScope.role == "ORGANIZATION_ADMIN", UserRoleScope.scope_id == organization.id)):
             db.add(UserRoleScope(user_id=user.id, role="ORGANIZATION_ADMIN", scope_type="ORGANIZATION", scope_id=organization.id))
-        seed_dashboard_demo_data(db, organization)
+        # Normal startup is idempotent. `python seed.py` performs the explicit
+        # reset of known test tenants requested for the retained QA dataset.
+        seed_qa_demo_workspace(db, organization, preserve_demo_admin_id=user.id)
         db.commit()
     finally:
         db.close()

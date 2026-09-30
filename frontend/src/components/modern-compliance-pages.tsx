@@ -46,7 +46,7 @@ import {
 
 const STATUS_COLORS = [
   "#2563eb",
-  "#d97706",
+  "#7c3aed",
   "#dc2626",
   "#059669",
   "#7c3aed",
@@ -358,7 +358,7 @@ export function ModernDashboard() {
                       <Tooltip />
                       <Legend />
                       <Bar dataKey="done" name="Completed" stackId="a" fill="#059669" />
-                      <Bar dataKey="due" name="Open" stackId="a" fill="#f59e0b" />
+                      <Bar dataKey="due" name="Open" stackId="a" fill="#4f46e5" />
                       <Bar dataKey="overdue" name="Overdue" stackId="a" fill="#dc2626" radius={[4, 4, 0, 0]} />
                     </BarChart>
                   </ResponsiveContainer>

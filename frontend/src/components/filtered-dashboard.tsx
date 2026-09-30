@@ -39,15 +39,26 @@ type DashboardFilters = {
   period_key: string;
 };
 
-const chartColors = [
-  "#2563eb",
-  "#4f46e5",
-  "#0f766e",
+const fallbackStatusColors = [
   "#059669",
   "#7c3aed",
-  "#64748b",
   "#dc2626",
+  "#0f766e",
+  "#2563eb",
+  "#64748b",
 ];
+
+function statusColor(status: string, index: number) {
+  const value = status.toUpperCase();
+  if (value.includes("COMPLETED") || value.includes("APPROVED"))
+    return "#059669";
+  if (value.includes("OVERDUE") || value.includes("REJECTED")) return "#dc2626";
+  if (value === "DUE") return "#2563eb";
+  if (value.includes("PENDING")) return "#7c3aed";
+  if (value.includes("REVIEW") || value.includes("SUBMITTED")) return "#0f766e";
+  if (value.includes("CORRECTION")) return "#2563eb";
+  return fallbackStatusColors[index % fallbackStatusColors.length];
+}
 
 function healthTone(rate: number, overdue: number) {
   if (overdue > 0) return "critical";
@@ -89,17 +100,25 @@ function HealthRankings({
             <div className="health-name">
               <b>{row.name}</b>
               <small>
-                {row.entity_type ? humanize(row.entity_type) : "Contractor"} · {row.completed}/{row.total} completed
+                {row.entity_type ? humanize(row.entity_type) : "Contractor"} ·{" "}
+                {row.completed}/{row.total} completed
               </small>
             </div>
-            <div className="health-progress" aria-label={row.rate + "% compliant"}>
+            <div
+              className="health-progress"
+              aria-label={row.rate + "% compliant"}
+            >
               <span
                 className={"health-progress-fill " + tone}
                 style={{ width: row.rate + "%" }}
               />
             </div>
             <b className={"health-rate " + tone}>{row.rate}%</b>
-            <span className={row.overdue ? "health-overdue has-overdue" : "health-overdue"}>
+            <span
+              className={
+                row.overdue ? "health-overdue has-overdue" : "health-overdue"
+              }
+            >
               {row.overdue} overdue
             </span>
           </div>
@@ -152,7 +171,10 @@ export function MainDashboard() {
             onClick={() => overview.refetch()}
             disabled={overview.isFetching}
           >
-            <RefreshCw size={16} className={overview.isFetching ? "spin" : ""} />
+            <RefreshCw
+              size={16}
+              className={overview.isFetching ? "spin" : ""}
+            />
             Refresh
           </button>
         }
@@ -232,7 +254,10 @@ export function MainDashboard() {
         </DashboardSection>
       ) : (
         <>
-          <section className="dashboard-metric-grid" aria-label="Compliance overview">
+          <section
+            className="dashboard-metric-grid"
+            aria-label="Compliance overview"
+          >
             <DashboardMetricCard
               label="Total obligations"
               value={summary?.total ?? 0}
@@ -260,7 +285,7 @@ export function MainDashboard() {
               label="Due in 7 days"
               value={summary?.due_soon ?? 0}
               helper="Upcoming open obligations"
-              tone="warning"
+              tone="attention"
             />
           </section>
 
@@ -284,7 +309,7 @@ export function MainDashboard() {
                         {data.status_distribution.map((entry, index) => (
                           <Cell
                             key={entry.name}
-                            fill={chartColors[index % chartColors.length]}
+                            fill={statusColor(entry.name, index)}
                           />
                         ))}
                       </Pie>
@@ -309,14 +334,17 @@ export function MainDashboard() {
               title="Upcoming deadlines"
               description="Open obligations due over the next 14 days."
               action={
-                <Link className="text-link" to={base + "/compliances/recurring"}>
+                <Link
+                  className="text-link"
+                  to={base + "/compliances/recurring"}
+                >
                   View worklist
                 </Link>
               }
             >
               {data?.upcoming.length ? (
                 <div className="deadline-list">
-                  {data.upcoming.slice(0, 5).map((item) => (
+                  {data.upcoming.slice(0, 8).map((item) => (
                     <Link
                       className="deadline-item"
                       key={item.id}
@@ -397,7 +425,10 @@ export function MainDashboard() {
               title="Contractor compliance"
               description="Compare contractor performance in the selected scope."
             >
-              <HealthRankings rows={data?.contractor_health ?? []} kind="contractor" />
+              <HealthRankings
+                rows={data?.contractor_health ?? []}
+                kind="contractor"
+              />
             </DashboardSection>
           </section>
 

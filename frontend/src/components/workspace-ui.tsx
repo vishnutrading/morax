@@ -71,6 +71,7 @@ const metricIcons: Record<string, Icon> = {
   total: FileCheck2,
   success: CheckCircle2,
   warning: Clock3,
+  attention: Clock3,
   critical: CircleAlert,
 };
 
@@ -83,7 +84,7 @@ export function DashboardMetricCard({
   label: string;
   value: number | string;
   helper?: string;
-  tone?: "total" | "success" | "warning" | "critical";
+  tone?: "total" | "success" | "warning" | "attention" | "critical";
 }) {
   const Icon = metricIcons[tone];
   return (

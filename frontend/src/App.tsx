@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useDeferredValue, useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import {
   BrowserRouter,
@@ -30,10 +30,12 @@ import type { LucideIcon } from "lucide-react";
 import { setToken } from "./api/client";
 import { morax } from "./api/morax";
 import type { Evidence, Instance, Master, RoleScope, User } from "./api/morax";
-import {
-  ModernWorklist,
-} from "./components/modern-compliance-pages";
+import { ModernWorklist } from "./components/modern-compliance-pages";
 import { MainDashboard } from "./components/filtered-dashboard";
+import { ModernEntities } from "./components/entity-manager";
+import { UserAccessManager } from "./components/user-access-manager";
+import { ComplianceMasterManager } from "./components/compliance-master-manager";
+import { DocumentLibrary } from "./components/document-library";
 import "./App.css";
 
 type Row = Record<string, unknown>;
@@ -343,7 +345,11 @@ function Layout({
             <WorkspaceNavLink label="Organizations" to="/app/organizations" />
           )}
           {workspaceLinks(user).map(([label, path]) => (
-            <WorkspaceNavLink key={path} label={label} to={prefix + "/" + path} />
+            <WorkspaceNavLink
+              key={path}
+              label={label}
+              to={prefix + "/" + path}
+            />
           ))}
         </nav>
         <button className="logout" onClick={logout}>
@@ -354,16 +360,29 @@ function Layout({
         <header className="app-topbar">
           <div>
             <span className="topbar-context">
-              {organizationId ? organizationName || "Organization workspace" : "MORAX Workspace"}
+              {organizationId
+                ? organizationName || "Organization workspace"
+                : "MORAX Workspace"}
             </span>
           </div>
           <div className="topbar-actions">
-            <Link className="topbar-icon-link" to={prefix + "/notifications"} aria-label="Notifications">
+            <Link
+              className="topbar-icon-link"
+              to={prefix + "/notifications"}
+              aria-label="Notifications"
+            >
               <Bell size={18} />
             </Link>
             <Link className="topbar-user" to={prefix + "/settings"}>
-              <span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span>
-              <span><b>{user.name}</b><small>{user.platform_role || user.roles[0] || "Workspace user"}</small></span>
+              <span className="avatar">
+                {user.name.slice(0, 1).toUpperCase()}
+              </span>
+              <span>
+                <b>{user.name}</b>
+                <small>
+                  {user.platform_role || user.roles[0] || "Workspace user"}
+                </small>
+              </span>
             </Link>
           </div>
         </header>
@@ -375,13 +394,18 @@ function Layout({
             path="compliances/detail/:id"
             element={<Detail user={user} />}
           />
-          <Route path="entities/:kind" element={<Entities user={user} />} />
+          <Route
+            path="entities/:kind"
+            element={<ModernEntities user={user} />}
+          />
           <Route
             path="users"
-            element={<Users user={user} onImpersonate={onImpersonate} />}
+            element={
+              <UserAccessManager user={user} onImpersonate={onImpersonate} />
+            }
           />
-          <Route path="compliance-master" element={<ComplianceMaster />} />
-          <Route path="documents" element={<Documents user={user} />} />
+          <Route path="compliance-master" element={<ComplianceMasterManager />} />
+          <Route path="documents" element={<DocumentLibrary user={user} />} />
           <Route path="notifications" element={<Notifications />} />
           <Route path="reports" element={<Reports />} />
           <Route path="audit" element={<Audit />} />
@@ -398,6 +422,7 @@ function Organizations({ user }: { user: User }) {
   const [rows, setRows] = useState<Row[]>([]);
   const [error, setError] = useState("");
   const [filters, setFilters] = useState({ q: "", status: "" });
+  const deferredSearch = useDeferredValue(filters.q);
   const blank = {
     organization_name: "",
     organization_code: "",
@@ -422,8 +447,15 @@ function Organizations({ user }: { user: User }) {
       .then(setRows)
       .catch((err) => setError(message(err)));
   useEffect(() => {
-    if (user.platform_role === "MORAX_ADMIN") load();
-  }, []);
+    if (user.platform_role !== "MORAX_ADMIN") return;
+    morax
+      .platformOrganizations({
+        q: deferredSearch.trim(),
+        status: filters.status,
+      })
+      .then(setRows)
+      .catch((err) => setError(message(err)));
+  }, [deferredSearch, filters.status, user.platform_role]);
   if (user.platform_role !== "MORAX_ADMIN")
     return <Panel>Platform administrator permission is required.</Panel>;
   const edit = (row: Row) => {
@@ -459,13 +491,7 @@ function Organizations({ user }: { user: User }) {
       </Header>
       <ErrorBox text={error} />
       <Panel>
-        <form
-          className="form-grid compact"
-          onSubmit={(event) => {
-            event.preventDefault();
-            load();
-          }}
-        >
+        <div className="form-grid compact">
           <label>
             Search
             <input
@@ -487,8 +513,16 @@ function Organizations({ user }: { user: User }) {
               <option>INACTIVE</option>
             </select>
           </label>
-          <button>Filter</button>
-        </form>
+          {(filters.q || filters.status) && (
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => setFilters({ q: "", status: "" })}
+            >
+              Clear filters
+            </button>
+          )}
+        </div>
       </Panel>
       <Panel>
         <h2>{editing ? "Edit organization" : "Create organization"}</h2>
@@ -742,7 +776,11 @@ function PlatformShell({
             <WorkspaceNavLink label="Organizations" to="/app/organizations" />
           )}
           {workspaceLinks(user).map(([label, path]) => (
-            <WorkspaceNavLink key={path} label={label} to={prefix + "/" + path} />
+            <WorkspaceNavLink
+              key={path}
+              label={label}
+              to={prefix + "/" + path}
+            />
           ))}
         </nav>
         <button className="logout" onClick={logout}>
@@ -751,12 +789,29 @@ function PlatformShell({
       </aside>
       <main className="content">
         <header className="app-topbar">
-          <span className="topbar-context">{organizationId ? "Organization workspace" : "Platform administration"}</span>
+          <span className="topbar-context">
+            {organizationId
+              ? "Organization workspace"
+              : "Platform administration"}
+          </span>
           <div className="topbar-actions">
-            <Link className="topbar-icon-link" to={prefix + "/notifications"} aria-label="Notifications"><Bell size={18} /></Link>
+            <Link
+              className="topbar-icon-link"
+              to={prefix + "/notifications"}
+              aria-label="Notifications"
+            >
+              <Bell size={18} />
+            </Link>
             <Link className="topbar-user" to={prefix + "/settings"}>
-              <span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span>
-              <span><b>{user.name}</b><small>{user.platform_role || user.roles[0] || "Workspace user"}</small></span>
+              <span className="avatar">
+                {user.name.slice(0, 1).toUpperCase()}
+              </span>
+              <span>
+                <b>{user.name}</b>
+                <small>
+                  {user.platform_role || user.roles[0] || "Workspace user"}
+                </small>
+              </span>
             </Link>
           </div>
         </header>
@@ -774,6 +829,7 @@ function OrganizationLanding({ user }: { user: User }) {
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState("");
   const [filters, setFilters] = useState({ q: "", status: "" });
+  const deferredSearch = useDeferredValue(filters.q);
   const blank = {
     organization_name: "",
     organization_code: "",
@@ -798,8 +854,15 @@ function OrganizationLanding({ user }: { user: User }) {
       .catch((err) => setError(message(err)));
 
   useEffect(() => {
-    if (user.platform_role === "MORAX_ADMIN") load();
-  }, []);
+    if (user.platform_role !== "MORAX_ADMIN") return;
+    morax
+      .platformOrganizations({
+        q: deferredSearch.trim(),
+        status: filters.status,
+      })
+      .then(setRows)
+      .catch((err) => setError(message(err)));
+  }, [deferredSearch, filters.status, user.platform_role]);
   if (user.platform_role !== "MORAX_ADMIN")
     return <Panel>Platform administrator permission is required.</Panel>;
 
@@ -1008,13 +1071,7 @@ function OrganizationLanding({ user }: { user: User }) {
         </Panel>
       )}
       <Panel>
-        <form
-          className="form-grid compact"
-          onSubmit={(event) => {
-            event.preventDefault();
-            load();
-          }}
-        >
+        <div className="form-grid compact">
           <label>
             Search
             <input
@@ -1036,23 +1093,18 @@ function OrganizationLanding({ user }: { user: User }) {
               <option>INACTIVE</option>
             </select>
           </label>
-          <div className="action-row">
-            <button>Filter</button>
-            <button
-              type="button"
-              className="secondary"
-              onClick={() => {
-                setFilters({ q: "", status: "" });
-                morax
-                  .platformOrganizations()
-                  .then(setRows)
-                  .catch((err) => setError(message(err)));
-              }}
-            >
-              Clear
-            </button>
-          </div>
-        </form>
+          {(filters.q || filters.status) && (
+            <div className="action-row">
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setFilters({ q: "", status: "" })}
+              >
+                Clear filters
+              </button>
+            </div>
+          )}
+        </div>
       </Panel>
       <div className="table-wrap">
         <table>

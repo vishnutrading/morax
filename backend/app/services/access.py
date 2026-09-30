@@ -65,6 +65,14 @@ def can_access_subject(db: Session, user: User, organization_id: str, subject_ty
     if is_org_admin(db, user, organization_id):
         return True
     scopes = scopes_for(db, user.id)
+    # An organization-scoped role is intentionally broader than an entity
+    # assignment, but must still name the active organization. This supports
+    # read-only organization viewers without exposing another tenant.
+    if any(
+        scope.scope_type == "ORGANIZATION" and scope.scope_id == organization_id
+        for scope in scopes
+    ):
+        return True
     if any(scope.scope_type == subject_type and scope.scope_id == subject_id for scope in scopes):
         return True
     if subject_type == "CONTRACTOR_SITE":
@@ -101,6 +109,11 @@ def accessible_subject_ids(db: Session, user: User, organization_id: str, subjec
     if is_org_admin(db, user, organization_id):
         return None
     scopes = scopes_for(db, user.id)
+    if any(
+        scope.scope_type == "ORGANIZATION" and scope.scope_id == organization_id
+        for scope in scopes
+    ):
+        return None
     ids = {scope.scope_id for scope in scopes if scope.scope_type == subject_type}
     if subject_type == "CONTRACTOR_SITE":
         contractor_ids = {scope.scope_id for scope in scopes if scope.scope_type == "CONTRACTOR"}
