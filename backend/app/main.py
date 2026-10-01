@@ -167,6 +167,7 @@ def seed_dashboard_demo_data(db, organization: Organization) -> None:
                 version=1,
                 name=name,
                 description="Seeded non-production data for dashboard visual testing.",
+                document_type="PROCEDURAL",
                 frequency=frequency,
                 due_date_rule="MANUAL",
                 required_document="Demo supporting evidence",

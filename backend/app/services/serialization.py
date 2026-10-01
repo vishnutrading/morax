@@ -46,8 +46,15 @@ def instance_dict(db: Session, instance: ComplianceInstance, detail: bool = Fals
     rule = db.get(ComplianceRule, version.rule_id) if version else None
     result = model_dict(instance, [field.name for field in instance.__table__.columns])
     result.update({
+        "rule_id": rule.id if rule else None,
+        "rule_name": version.name if version else None,
         "compliance_id": rule.compliance_id if rule else None,
         "compliance_name": version.name if version else None,
+        "act": version.act if version else None,
+        "rule_reference": version.rule_reference if version else None,
+        "compliance_type": version.compliance_type if version else None,
+        "document_type": version.document_type if version and version.document_type else "PROCEDURAL",
+        "form_number": version.form_number if version else None,
         "frequency": version.frequency if version else None,
         "risk_level": version.risk_level if version else None,
         "required_document": version.required_document if version else None,

@@ -26,6 +26,16 @@ const dueRules = [
   "ONE_TIME_CONFIGURED_DATE",
   "MANUAL",
 ];
+const documentTypes = [
+  ["PROCEDURAL", "Procedural"],
+  ["REGISTER", "Register"],
+  ["REMITTANCE", "Remittance"],
+  ["RETURN", "Return"],
+  ["RECORDS", "Records"],
+  ["INTIMATION_FILING", "Intimation/Filing"],
+  ["DISPLAY", "Display"],
+  ["NOTICE", "Notice"],
+] as const;
 
 const ruleSchema = z.object({
   compliance_id: z.string().trim().min(1, "Compliance ID is required"),
@@ -722,7 +732,12 @@ export function ComplianceMasterManager() {
                   <input {...form.register("compliance_type")} />
                 </RuleField>
                 <RuleField label="Document type">
-                  <input {...form.register("document_type")} />
+                  <select {...form.register("document_type")}>
+                    <option value="">Select document type</option>
+                    {documentTypes.map(([value, label]) => (
+                      <option key={value} value={value}>{label}</option>
+                    ))}
+                  </select>
                 </RuleField>
                 <RuleField label="Form number">
                   <input {...form.register("form_number")} />

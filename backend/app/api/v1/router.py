@@ -21,7 +21,7 @@ from app.models import (
 from app.schemas import (
     ActivityInput, AssignmentInput, CommentInput, ContractorInput, ContractorSiteInput, GenerationRequest,
     LoginRequest, OrganizationInput, PlatformOrganizationInput, OrganizationStatusInput, PasswordChangeRequest, RoleScopeInput, RuleInput, UnitInput, UserInput,
-    WorkflowDecision, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput, RuleStatusInput,
+    WorkflowDecision, UserUpdateInput, EvidenceVerificationInput, NotApplicableInput, RuleStatusInput, DOCUMENT_TYPES,
 )
 from app.services.access import CHECKER_ROLES, MAKER_ROLES, MANAGER_ROLES, PLATFORM_ADMIN_ROLE, can_access_subject, can_read_audit, current_user, is_org_admin, require_org_admin, require_org_admin_for_entity_management, roles_for, scopes_for, user_summary
 from app.services.audit import audit
@@ -977,9 +977,28 @@ def run_generation(payload: GenerationRequest, user: User = Depends(current_user
     db.commit(); return {"created": len(created), "instance_ids": [item.id for item in created]}
 
 
-@router.get("/compliance-instances")
-def list_instances(frequency: str | None = None, status: str | None = None, risk_level: str | None = None, entity_type: str | None = None, date_from: date | None = None, date_to: date | None = None, q: str | None = None, page: int = 1, page_size: int = 50, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    org = org_for(user); instances = list(db.scalars(select(ComplianceInstance).where(ComplianceInstance.organization_id == org).order_by(ComplianceInstance.due_date)))
+def filtered_instance_rows(
+    db: Session,
+    user: User,
+    *,
+    frequency: str | None = None,
+    status: str | None = None,
+    risk_level: str | None = None,
+    entity_type: str | None = None,
+    document_type: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    q: str | None = None,
+) -> list[dict]:
+    """Apply a single, access-controlled filter path for compliance worklists."""
+    org = org_for(user)
+    instances = list(
+        db.scalars(
+            select(ComplianceInstance)
+            .where(ComplianceInstance.organization_id == org)
+            .order_by(ComplianceInstance.due_date)
+        )
+    )
     results = []
     for instance in instances:
         if not can_access_subject(db, user, org, instance.subject_type, instance.subject_id): continue
@@ -988,11 +1007,91 @@ def list_instances(frequency: str | None = None, status: str | None = None, risk
         if status and status not in {instance.status, row["display_status"]}: continue
         if risk_level and row["risk_level"] != risk_level: continue
         if entity_type and instance.subject_type != entity_type: continue
+        if document_type and row["document_type"] != document_type: continue
         if date_from and instance.due_date < date_from: continue
         if date_to and instance.due_date > date_to: continue
-        if q and q.lower() not in " ".join(str(row.get(key) or "") for key in ("compliance_id", "compliance_name", "subject_name")).lower(): continue
+        if q and q.lower() not in " ".join(str(row.get(key) or "") for key in ("compliance_id", "compliance_name", "rule_name", "act", "rule_reference", "subject_name")).lower(): continue
         results.append(row)
+    return results
+
+
+@router.get("/compliance-instances")
+def list_instances(frequency: str | None = None, status: str | None = None, risk_level: str | None = None, entity_type: str | None = None, document_type: str | None = None, date_from: date | None = None, date_to: date | None = None, q: str | None = None, page: int = 1, page_size: int = 50, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if document_type and document_type not in DOCUMENT_TYPES:
+        raise HTTPException(422, "Unsupported document type")
+    results = filtered_instance_rows(db, user, frequency=frequency, status=status, risk_level=risk_level, entity_type=entity_type, document_type=document_type, date_from=date_from, date_to=date_to, q=q)
     return list_page(results, page, min(page_size, 100))
+
+
+@router.get("/compliance-instances/grouped")
+def list_grouped_instances(
+    frequency: str | None = None,
+    status: str | None = None,
+    risk_level: str | None = None,
+    entity_type: str | None = None,
+    document_type: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    q: str | None = None,
+    page: int = 1,
+    page_size: int = 25,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Return recurring obligations grouped by their configured rule/Act.
+
+    Counts are calculated after every non-document filter and before the active
+    document-type tab is applied.  This makes every tab a live count while
+    keeping authorization entirely on the server.
+    """
+    if document_type and document_type not in DOCUMENT_TYPES:
+        raise HTTPException(422, "Unsupported document type")
+    if frequency == "ONE_TIME":
+        raise HTTPException(422, "The grouped recurring worklist does not support ONE_TIME frequency")
+
+    base_rows = [
+        row for row in filtered_instance_rows(
+            db, user, frequency=frequency, status=status, risk_level=risk_level,
+            entity_type=entity_type, date_from=date_from, date_to=date_to, q=q,
+        )
+        if row["frequency"] != "ONE_TIME"
+    ]
+    type_counts = [
+        {"document_type": item, "count": sum(row["document_type"] == item for row in base_rows)}
+        for item in DOCUMENT_TYPES
+    ]
+    rows = [row for row in base_rows if not document_type or row["document_type"] == document_type]
+    grouped: dict[str, dict] = {}
+    for row in rows:
+        # The Compliance Master rule is the stable grouping identity.  Its
+        # configured name is displayed; an Act may be shared by several rules
+        # and therefore must not merge distinct operational obligations.
+        group_key = row["rule_id"]
+        group_name = row["rule_name"] or row["compliance_name"]
+        group = grouped.setdefault(group_key, {"id": group_key, "name": group_name, "records": []})
+        group["records"].append(row)
+
+    groups = []
+    for group in grouped.values():
+        records = sorted(group["records"], key=lambda row: (row["due_date"], row["subject_name"].lower()))
+        groups.append({
+            **group,
+            "records": records,
+            "compliance_count": len(records),
+            "due_count": sum(row["status"] not in {"APPROVED", "NOT_APPLICABLE"} for row in records),
+        })
+    groups.sort(key=lambda group: group["name"].lower())
+    safe_page = max(1, page)
+    safe_page_size = min(max(1, page_size), 50)
+    start = (safe_page - 1) * safe_page_size
+    return {
+        "groups": groups[start : start + safe_page_size],
+        "total_compliances": len(rows),
+        "total_rules": len(groups),
+        "document_type_counts": type_counts,
+        "page": safe_page,
+        "page_size": safe_page_size,
+    }
 
 
 def get_instance_or_404(db: Session, user: User, instance_id: str) -> ComplianceInstance:

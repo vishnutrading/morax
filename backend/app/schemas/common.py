@@ -1,7 +1,21 @@
 from datetime import date, datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
+
+
+# These are MORAX classifications used to organise documents.  They deliberately
+# describe the artefact expected from a compliance, rather than a legal outcome.
+DOCUMENT_TYPES = (
+    "PROCEDURAL",
+    "REGISTER",
+    "REMITTANCE",
+    "RETURN",
+    "RECORDS",
+    "INTIMATION_FILING",
+    "DISPLAY",
+    "NOTICE",
+)
 
 
 class ORMModel(BaseModel):
@@ -213,6 +227,25 @@ class RuleInput(BaseModel):
     effective_from: date
     effective_to: date | None = None
     active: bool = True
+
+    @field_validator("document_type")
+    @classmethod
+    def document_type_is_supported(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip().upper().replace("/", "_").replace("-", "_").replace(" ", "_")
+        aliases = {
+            "REGISTERS": "REGISTER",
+            "RETURNS": "RETURN",
+            "RECORD": "RECORDS",
+            "SUPPORTING_RECORD": "RECORDS",
+            "SUPPORTING_EVIDENCE": "RECORDS",
+            "INTIMATION_FILING": "INTIMATION_FILING",
+        }
+        normalized = aliases.get(normalized, normalized)
+        if normalized not in DOCUMENT_TYPES:
+            raise ValueError("Document Type must be one of: " + ", ".join(DOCUMENT_TYPES))
+        return normalized
 
     @model_validator(mode="after")
     def effective_dates_are_in_order(self) -> "RuleInput":

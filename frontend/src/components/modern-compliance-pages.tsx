@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 import {
   AlertTriangle,
   ArrowUpDown,
@@ -7,11 +8,13 @@ import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   ClipboardCheck,
   ExternalLink,
   Eye,
   FileText,
   Filter,
+  Layers3,
   RefreshCw,
   Search,
   X,
@@ -386,6 +389,30 @@ type WorklistFilters = {
   due_window: string;
 };
 
+const documentTypeLabels: Record<string, string> = {
+  PROCEDURAL: "Procedural",
+  REGISTER: "Register",
+  REMITTANCE: "Remittance",
+  RETURN: "Return",
+  RECORDS: "Records",
+  INTIMATION_FILING: "Intimation/Filing",
+  DISPLAY: "Display",
+  NOTICE: "Notice",
+};
+
+const documentTypeOrder = [
+  "REMITTANCE", "RETURN", "REGISTER", "RECORDS", "INTIMATION_FILING", "DISPLAY", "NOTICE", "PROCEDURAL",
+];
+
+function useDebouncedValue<T>(value: T, delay = 350) {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebounced(value), delay);
+    return () => window.clearTimeout(timer);
+  }, [delay, value]);
+  return debounced;
+}
+
 function ComplianceActionDialog({
   item,
   onClose,
@@ -456,7 +483,119 @@ function ComplianceActionDialog({
   );
 }
 
+function GroupedRecurringWorklist() {
+  const { organizationId } = useParams();
+  const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
+  const [selected, setSelected] = useState<Instance>();
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const [page, setPage] = useState(1);
+  const [filters, setFilters] = useState<WorklistFilters & { document_type: string }>({
+    q: "", status: "", risk_level: "", entity_type: "", frequency: "", due_window: "", document_type: "",
+  });
+  const debouncedSearch = useDebouncedValue(filters.q.trim());
+  const queryFilters = useMemo(() => {
+    const values: Record<string, string> = { page: String(page), page_size: "20" };
+    if (debouncedSearch) values.q = debouncedSearch;
+    if (filters.status) values.status = filters.status;
+    if (filters.risk_level) values.risk_level = filters.risk_level;
+    if (filters.entity_type) values.entity_type = filters.entity_type;
+    if (filters.frequency) values.frequency = filters.frequency;
+    if (filters.document_type) values.document_type = filters.document_type;
+    if (filters.due_window === "NEXT_7" || filters.due_window === "NEXT_30") {
+      values.date_from = toDateInput(new Date());
+      values.date_to = filters.due_window === "NEXT_7" ? dateAfter(7) : dateAfter(30);
+    }
+    return values;
+  }, [debouncedSearch, filters, page]);
+  const grouped = useQuery({
+    queryKey: ["grouped-recurring-compliances", queryFilters],
+    queryFn: () => morax.groupedInstances(queryFilters),
+    staleTime: 20_000,
+  });
+  const data = grouped.data;
+  const totalPages = Math.max(1, Math.ceil((data?.total_rules ?? 0) / (data?.page_size ?? 20)));
+  const activeFilters = [
+    filters.status && ["Status", humanize(filters.status)],
+    filters.risk_level && ["Risk", humanize(filters.risk_level)],
+    filters.entity_type && ["Entity type", humanize(filters.entity_type)],
+    filters.frequency && ["Frequency", humanize(filters.frequency)],
+    filters.due_window && ["Due date", filters.due_window === "NEXT_7" ? "Next 7 days" : "Next 30 days"],
+    filters.document_type && ["Document type", documentTypeLabels[filters.document_type]],
+    filters.q && ["Search", filters.q],
+  ].filter(Boolean) as [string, string][];
+  const updateFilter = <K extends keyof typeof filters>(field: K, value: (typeof filters)[K]) => {
+    setPage(1);
+    setFilters((current) => ({ ...current, [field]: value }));
+  };
+  const clearFilters = () => {
+    setPage(1);
+    setFilters({ q: "", status: "", risk_level: "", entity_type: "", frequency: "", due_window: "", document_type: "" });
+  };
+  const removeFilter = (label: string) => {
+    const fields: Record<string, keyof typeof filters> = {
+      Status: "status", Risk: "risk_level", "Entity type": "entity_type", Frequency: "frequency",
+      "Due date": "due_window", "Document type": "document_type", Search: "q",
+    };
+    updateFilter(fields[label], "");
+  };
+  const toggleGroup = (id: string) => setExpanded((current) => {
+    const next = new Set(current);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const expandAll = () => setExpanded(new Set(data?.groups.map((group) => group.id) ?? []));
+
+  return (
+    <div className="modern-page grouped-compliance-page">
+      <WorkspacePageHeader
+        title="Compliances — Grouped by Rule"
+        description="Recurring obligations grouped by their configured Act, regulation, or rule."
+        actions={<button className="button-secondary" type="button" onClick={() => grouped.refetch()} disabled={grouped.isFetching}><RefreshCw size={16} className={grouped.isFetching ? "spin" : ""} />Refresh</button>}
+      />
+      <InlineError message={grouped.error instanceof Error ? grouped.error.message : ""} />
+
+      <DashboardSection title="Filters" description="Results update automatically as filters change." className="filter-section" action={activeFilters.length ? <button className="text-button" type="button" onClick={clearFilters}><X size={15} />Clear all</button> : undefined}>
+        <div className="filter-grid grouped-filter-grid">
+          <label className="search-control"><span>Search</span><Search size={16} aria-hidden="true" /><input value={filters.q} onChange={(event) => updateFilter("q", event.target.value)} placeholder="Search rule, compliance, or entity" /></label>
+          <label>Status<select value={filters.status} onChange={(event) => updateFilter("status", event.target.value)}><option value="">All statuses</option>{statusOptions.map((value) => <option value={value} key={value}>{humanize(value)}</option>)}</select></label>
+          <label>Risk level<select value={filters.risk_level} onChange={(event) => updateFilter("risk_level", event.target.value)}><option value="">All risk levels</option>{["LOW", "MEDIUM", "HIGH", "CRITICAL"].map((value) => <option value={value} key={value}>{humanize(value)}</option>)}</select></label>
+          <label>Entity type<select value={filters.entity_type} onChange={(event) => updateFilter("entity_type", event.target.value)}><option value="">All entities</option>{["UNIT", "CONTRACTOR", "CONTRACTOR_SITE"].map((value) => <option value={value} key={value}>{humanize(value)}</option>)}</select></label>
+          <label>Frequency<select value={filters.frequency} onChange={(event) => updateFilter("frequency", event.target.value)}><option value="">All recurring frequencies</option>{recurringFrequencies.map((value) => <option value={value} key={value}>{humanize(value)}</option>)}</select></label>
+          <label>Due date<select value={filters.due_window} onChange={(event) => updateFilter("due_window", event.target.value)}><option value="">All due dates</option><option value="NEXT_7">Next 7 days</option><option value="NEXT_30">Next 30 days</option></select></label>
+        </div>
+        {activeFilters.length > 0 && <div className="active-filters" aria-label="Active filters">{activeFilters.map(([label, value]) => <FilterChip key={label} label={`${label}: ${value}`} onRemove={() => removeFilter(label)} />)}</div>}
+      </DashboardSection>
+
+      <DashboardSection title="Compliances — Grouped by Rule" description={data ? `${data.total_compliances} compliance${data.total_compliances === 1 ? "" : "s"} across ${data.total_rules} applicable rule${data.total_rules === 1 ? "" : "s"}` : "Loading applicable rules"} className="grouped-compliance-section" action={<div className="group-actions"><button className="button-secondary compact-action" type="button" onClick={expandAll} disabled={!data?.groups.length}><ChevronDown size={15} />Expand all</button><button className="button-secondary compact-action" type="button" onClick={() => setExpanded(new Set())} disabled={!expanded.size}><ChevronDown size={15} className="collapse-icon" />Collapse all</button></div>}>
+        <div className="document-type-tabs" aria-label="Filter by document type">
+          <button className={`document-type-tab ${!filters.document_type ? "active" : ""}`} type="button" onClick={() => updateFilter("document_type", "")}>All <span>{data?.document_type_counts.reduce((total, item) => total + item.count, 0) ?? 0}</span></button>
+          {documentTypeOrder.map((type) => {
+            const count = data?.document_type_counts.find((item) => item.document_type === type)?.count ?? 0;
+            return <button className={`document-type-tab ${filters.document_type === type ? "active" : ""}`} type="button" onClick={() => updateFilter("document_type", type)} key={type}>{documentTypeLabels[type]} <span>{count}</span></button>;
+          })}
+        </div>
+        {grouped.isLoading ? <LoadingSkeleton rows={7} /> : data?.groups.length ? <div className="rule-group-list">{data.groups.map((group) => {
+          const isExpanded = expanded.has(group.id);
+          return <article className={`rule-group ${isExpanded ? "expanded" : ""}`} key={group.id}>
+            <button className="rule-group-header" type="button" onClick={() => toggleGroup(group.id)} aria-expanded={isExpanded}>
+              <span className="rule-group-title"><span className="rule-group-icon"><Layers3 size={18} /></span><span>{group.name}</span><span className="rule-count">{group.compliance_count} compliance{group.compliance_count === 1 ? "" : "s"}</span></span>
+              <span className="rule-group-meta"><span className={group.due_count ? "rule-due-count" : "rule-due-count clear"}>{group.due_count} due</span><ChevronDown size={19} className={isExpanded ? "chevron-up" : ""} /></span>
+            </button>
+            {isExpanded && <div className="modern-table-wrap rule-records-table"><table className="modern-table"><thead><tr><th>Entity</th><th>Compliance type</th><th>Document type</th><th>Form no.</th><th>Frequency / period</th><th>Due date</th><th>Risk</th><th>Status</th><th><span className="sr-only">Actions</span></th></tr></thead><tbody>{group.records.map((item) => <tr key={item.id}><td><b>{item.subject_name}</b><small>{humanize(item.subject_type)}</small></td><td><b>{item.compliance_name}</b><small>{item.compliance_id}</small></td><td>{documentTypeLabels[item.document_type ?? ""] ?? humanize(item.document_type ?? "PROCEDURAL")}</td><td>{item.form_number || "—"}</td><td>{humanize(item.frequency)}<small>{item.period_key}</small></td><td><span className={item.is_overdue ? "table-due overdue" : "table-due"}>{formatDate(item.due_date)}<small>{item.is_overdue ? `${item.days_overdue}d overdue` : dueSoon(item) ? "Due soon" : ""}</small></span></td><td><span className={`risk-label ${item.risk_level.toLowerCase()}`}>{humanize(item.risk_level)}</span></td><td><ComplianceStatusBadge status={item.display_status ?? item.status} /></td><td><button className="icon-action" type="button" onClick={() => setSelected(item)} aria-label={`Open ${item.compliance_name}`}><Eye size={16} /></button></td></tr>)}</tbody></table></div>}
+          </article>;
+        })}{totalPages > 1 && <div className="pagination-row"><span>Showing rule groups {(page - 1) * (data.page_size ?? 20) + 1}–{Math.min(page * (data.page_size ?? 20), data.total_rules)} of {data.total_rules}</span><div><button className="icon-button" type="button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page === 1} aria-label="Previous rule groups"><ChevronLeft size={17} /></button><span>Page {page} of {totalPages}</span><button className="icon-button" type="button" onClick={() => setPage((current) => Math.min(totalPages, current + 1))} disabled={page === totalPages} aria-label="Next rule groups"><ChevronRight size={17} /></button></div></div>}</div> : <EmptyState title="No recurring compliance records match" description="Try removing a filter or generate applicable obligations from the Compliance Master." icon={FileText} />}
+      </DashboardSection>
+      <ComplianceActionDialog item={selected} onClose={() => setSelected(undefined)} detailPath={selected ? `${base}/compliances/detail/${selected.id}` : ""} />
+    </div>
+  );
+}
+
 export function ModernWorklist() {
+  const { kind } = useParams();
+  return kind === "recurring" ? <GroupedRecurringWorklist /> : <OneTimeWorklist />;
+}
+
+function OneTimeWorklist() {
   const { kind, organizationId } = useParams();
   const base = organizationId ? `/app/organizations/${organizationId}` : "/app";
   const isOneTime = kind === "one-time";

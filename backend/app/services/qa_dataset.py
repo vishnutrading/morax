@@ -298,6 +298,7 @@ def _rule(
     due_date_offset: int | None,
     required_document: str | None,
     risk_level: str,
+    document_type: str = "PROCEDURAL",
     active: bool = True,
     due_date_anchor: str | None = None,
 ) -> ComplianceRuleVersion:
@@ -319,7 +320,7 @@ def _rule(
         rule_reference="QA-1",
         section="Demo",
         compliance_type="RETURN",
-        document_type="Supporting record",
+        document_type=document_type,
         form_number="QA-FORM-01",
         frequency=frequency,
         due_date_rule=due_date_rule,
@@ -552,6 +553,37 @@ def ensure_qa_upcoming_deadlines(
         )
 
 
+def ensure_qa_document_type_distribution(db: Session, organization: Organization) -> None:
+    """Keep the retained fictional demo useful for document-type filtering."""
+    types = {
+        "QA-IT-UNIT-MON": "RECORDS",
+        "QA-IT-UNIT-QTR": "RETURN",
+        "QA-MFG-UNIT-MON": "REGISTER",
+        "QA-MFG-SITE-MON": "RECORDS",
+        "QA-MFG-CON-HALF": "REMITTANCE",
+        "QA-HC-UNIT-MON": "RECORDS",
+        "QA-HC-SITE-QTR": "INTIMATION_FILING",
+        "QA-CON-UNIT-MON": "REGISTER",
+        "QA-CON-SITE-MON": "RECORDS",
+        "QA-CON-CON-ANNUAL": "PROCEDURAL",
+        "QA-AUTO-UNIT-MON": "REGISTER",
+        "QA-AUTO-SITE-QTR": "DISPLAY",
+        "QA-AUTO-CON-ANNUAL": "NOTICE",
+        "QA-IT-ONBOARD": "PROCEDURAL",
+        "QA-INACTIVE-RULE": "PROCEDURAL",
+        "QA-UPCOMING-IT-01": "RECORDS",
+        "QA-UPCOMING-MFG-01": "RETURN",
+        "QA-UPCOMING-CON-01": "REGISTER",
+        "QA-UPCOMING-HC-01": "INTIMATION_FILING",
+    }
+    rows = db.query(ComplianceRule, ComplianceRuleVersion).join(
+        ComplianceRuleVersion, ComplianceRuleVersion.rule_id == ComplianceRule.id
+    ).filter(ComplianceRule.organization_id == organization.id).all()
+    for rule, version in rows:
+        if rule.compliance_id in types:
+            version.document_type = types[rule.compliance_id]
+
+
 def seed_qa_demo_workspace(
     db: Session,
     organization: Organization,
@@ -571,6 +603,7 @@ def seed_qa_demo_workspace(
             Unit.code == "QA-IT-BLR",
         )
     ):
+        ensure_qa_document_type_distribution(db, organization)
         ensure_qa_upcoming_deadlines(db, organization, preserve_demo_admin_id)
         return
 
@@ -897,6 +930,7 @@ def seed_qa_demo_workspace(
         )
     )
     ensure_qa_upcoming_deadlines(db, organization, preserve_demo_admin_id)
+    ensure_qa_document_type_distribution(db, organization)
 
 
 def reset_and_seed_qa_dataset(db: Session, bootstrap_admin_id: str | None = None) -> None:
